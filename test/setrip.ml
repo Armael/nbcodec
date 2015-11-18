@@ -9,6 +9,9 @@
 let io_buffer_size = 65535                          (* IO_BUFFER_SIZE 4.00.1 *)
 let unix_buffer_size = 65535                      (* UNIX_BUFFER_SIZE 4.00.1 *)
 
+effect Input : (bytes * int * int) option
+effect Output : (bytes * int * int) option -> unit
+
 let rec unix_read fd s k l = try Unix.read fd s k l with
 | Unix.Unix_error (Unix.EINTR, _, _) -> unix_read fd s k l
 
@@ -50,6 +53,9 @@ let enb_dst_for = function
 | `Buffer b -> Se.Enb.dst_of_buffer b
 | `Channel oc -> Se.Enb.dst_of_channel oc
 
+let enb_effect_src : Se.Enb.src = fun () -> perform Input
+let enb_effect_dst : Se.Enb.dst = fun data -> perform (Output data)
+
 (* Decode only *)
 
 let decode_b src =
@@ -81,26 +87,29 @@ let decode_nb_unix usize fd =
   loop (Se.Nb.decoder `Manual) fd (Bytes.create usize)
 
 let decode_enb src =
+  let handler_src = enb_src_for src in
   let rec loop d = match Se.Enb.decode d with
   | `Lexeme l -> loop d
   | `End -> `Ok
   | `Error -> `Error
   in
-  loop (Se.Enb.decoder (enb_src_for src))
+  try loop (Se.Enb.decoder enb_effect_src)
+  with effect Input k -> continue k (handler_src ())
 
 let decode_enb_unix usize fd =
-  let rec loop d = match Se.Enb.decode d with
-  | `Lexeme l -> loop d
-  | `End -> `Ok
-  | `Error -> `Error
-  in
-  let src =
+  let handler_src =
     let db = Bytes.create usize in
     fun () ->
       let rc = unix_read fd db 0 (Bytes.length db) in
       if rc = 0 then None else Some (db, 0, rc)
   in
-  loop (Se.Enb.decoder src)
+  let rec loop d = match Se.Enb.decode d with
+  | `Lexeme l -> loop d
+  | `End -> `Ok
+  | `Error -> `Error
+  in
+  try loop (Se.Enb.decoder enb_effect_src)
+  with effect Input k -> continue k (handler_src ())
 
 let decode mode sin use_unix usize =
   let src = src_for use_unix sin in
@@ -140,7 +149,11 @@ let encode_nb dst =
   let e = Se.Nb.encoder dst in
   fun v -> match Se.Nb.encode e v with `Ok -> () | `Partial -> assert false
 
-let encode_enb dst = Se.Enb.encode (Se.Enb.encoder (enb_dst_for dst))
+let encode_enb dst l =
+  let handler_dst = enb_dst_for dst in
+  try Se.Enb.encode (Se.Enb.encoder enb_effect_dst) l
+  with effect (Output data) k ->
+    continue k (handler_dst data)
 
 let rec encode_unix fd e eb v = match Se.Nb.encode e v with `Ok -> ()
 | `Partial ->
@@ -154,13 +167,15 @@ let encode_nb_unix usize fd =
   Se.Nb.Manual.dst e eb 0 (Bytes.length eb);
   encode_unix fd e eb
 
-let encode_enb_unix usize fd =
+let encode_enb_unix usize fd l =
   let buf = Bytes.create usize in
-  let dst = function
+  let handler_dst = function
   | Some (o, pos, len) -> unix_really_write fd o pos len
   | None -> ()
   in
-  Se.Enb.encode (Se.Enb.encoder ~buf dst)
+  try Se.Enb.encode (Se.Enb.encoder ~buf enb_effect_dst) l
+  with effect (Output data) k ->
+    continue k (handler_dst data)
 
 type encode_f = [ `Lexeme of Se.lexeme | `End] -> unit
 
@@ -199,12 +214,18 @@ let trip_nb src dst =
   loop (Se.Nb.decoder src) (Se.Nb.encoder dst)
 
 let trip_enb src dst =
+  let handler_src = enb_src_for src in
+  let handler_dst = enb_dst_for dst in
   let rec loop d e = match Se.Enb.decode d with
+  | effect Input k -> continue k (handler_src ())
   | `Lexeme _ as l -> Se.Enb.encode e l; loop d e
   | `End -> Se.Enb.encode e `End; `Ok
   | `Error -> `Error
   in
-  loop (Se.Enb.decoder (enb_src_for src)) (Se.Enb.encoder (enb_dst_for dst))
+  try loop (Se.Enb.decoder enb_effect_src) (Se.Enb.encoder enb_effect_dst)
+  with
+  | effect Input k -> continue k (handler_src ())
+  | effect (Output data) k -> continue k (handler_dst data)
 
 let trip_nb_unix usize fdi fdo =
   let rec loop fdi fdo d db e eb = match Se.Nb.decode d with
@@ -226,18 +247,21 @@ let trip_enb_unix usize fdi fdo =
   | `End -> Se.Enb.encode e `End; `Ok
   | `Error -> `Error
   in
-  let src =
+  let handler_src =
     let db = Bytes.create usize in
     fun () ->
       let rc = unix_read fdi db 0 (Bytes.length db) in
       if rc = 0 then None else Some (db, 0, rc)
   in
-  let dst = function
+  let handler_dst = function
   | None -> ()
   | Some (o, pos, len) -> unix_really_write fdo o pos len
   in
   let eb = Bytes.create usize in
-  loop (Se.Enb.decoder src) (Se.Enb.encoder ~buf:eb dst)
+  try loop (Se.Enb.decoder enb_effect_src) (Se.Enb.encoder ~buf:eb enb_effect_dst)
+  with
+  | effect Input k -> continue k (handler_src ())
+  | effect (Output data) k -> continue k (handler_dst data)
 
 let trip mode sin sout use_unix usize =
   let src = src_for use_unix sin in
